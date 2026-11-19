@@ -1,170 +1,53 @@
-# ╔══════════════════════════════════════════════════════════╗
-# ║  POWER UP — IPA Signer                                  ║
-# ║  يقبل أي IPA → يصلحها → يرفعها كـ artifact            ║
-# ║  Runner: macos-13 (أكثر توفراً على free tier)          ║
-# ╚══════════════════════════════════════════════════════════╝
-
-name: Sign IPA
-
+name: Build IPA (Lovable)
 on:
   workflow_dispatch:
-    inputs:
-      ipa_url:
-        description: "رابط IPA مباشر (https://...ipa) أو اتركه فارغ لو رافع artifact"
-        required: false
-        default: ""
-        type: string
-      output_name:
-        description: "اسم الملف الناتج (بدون .ipa)"
-        required: false
-        default: "POWER_UP_signed"
-        type: string
-      bundle_id:
-        description: "Bundle ID جديد (اختياري — اتركه فارغ تبقى نفس)"
-        required: false
-        default: ""
-        type: string
-      display_name:
-        description: "اسم التطبيق (اختياري)"
-        required: false
-        default: ""
-        type: string
-
-permissions:
-  contents: read
-
 jobs:
-  sign:
-    runs-on: macos-13          # ← macos-13 أكثر availability من 14/15
-    timeout-minutes: 20
-
+  build:
+    runs-on: macos-latest
     steps:
-      # ── 1. Checkout (للـ scripts فقط) ─────────────────────
-      - name: Checkout
-        uses: actions/checkout@v3    # v3 = Node.js 16 — no deprecation warning
-
-      # ── 2. تحميل IPA من رابط أو من artifact ──────────────
-      - name: Download IPA
-        env:
-          IPA_URL: ${{ inputs.ipa_url }}
+      - uses: actions/checkout@v4
+      - name: Unzip archives if present
         run: |
-          set -euo pipefail
-          WORK="$RUNNER_TEMP/ipa_work"
-          mkdir -p "$WORK"
-
-          if [ -n "$IPA_URL" ]; then
-            echo "Downloading from URL..."
-            curl -fsSL "$IPA_URL" -o "$WORK/input.ipa"
-          else
-            # ابحث عن IPA في الريبو نفسه
-            IPA_IN_REPO=$(find "$GITHUB_WORKSPACE" -name '*.ipa' -type f | head -1 || true)
-            if [ -n "$IPA_IN_REPO" ]; then
-              echo "Found IPA in repo: $IPA_IN_REPO"
-              cp "$IPA_IN_REPO" "$WORK/input.ipa"
-            else
-              echo "No IPA provided. Upload an IPA file to the repo root or provide a URL." >&2
-              exit 1
-            fi
-          fi
-
-          # تحقق من الملف
-          file "$WORK/input.ipa"
-          du -sh "$WORK/input.ipa"
-          echo "ipa_path=$WORK/input.ipa" >> "$GITHUB_ENV"
-          echo "work_dir=$WORK"           >> "$GITHUB_ENV"
-
-      # ── 3. فك الضغط وإصلاح البنية ─────────────────────────
-      - name: Extract and patch IPA
-        env:
-          BUNDLE_ID:    ${{ inputs.bundle_id }}
-          DISPLAY_NAME: ${{ inputs.display_name }}
-          OUTPUT_NAME:  ${{ inputs.output_name }}
+          find . -name "*.zip" -not -path "./.git/*" | while read z; do
+            echo "Unzipping $z"; unzip -o -q "$z" -d "$(dirname "$z")"
+          done
+      - name: Detect project type
+        id: detect
         run: |
-          set -euo pipefail
-          WORK="$work_dir"
-          EXTRACT="$WORK/extracted"
-          mkdir -p "$EXTRACT"
-
-          # فك الضغط
-          unzip -q "$ipa_path" -d "$EXTRACT"
-
-          # إيجاد الـ .app
-          APP_PATH=$(find "$EXTRACT/Payload" -maxdepth 1 -name '*.app' -type d | head -1)
-          if [ -z "$APP_PATH" ]; then
-            echo "No .app found inside Payload/" >&2
-            ls "$EXTRACT/" || true
-            exit 1
-          fi
-          echo "App: $APP_PATH"
-
-          PLIST="$APP_PATH/Info.plist"
-
-          # ── تعديل Bundle ID ─────────────────────────────────
-          if [ -n "$BUNDLE_ID" ]; then
-            /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$PLIST"
-            echo "Bundle ID → $BUNDLE_ID"
-          fi
-
-          # ── تعديل اسم التطبيق ───────────────────────────────
-          if [ -n "$DISPLAY_NAME" ]; then
-            /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $DISPLAY_NAME" "$PLIST" 2>/dev/null || \
-            /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string $DISPLAY_NAME" "$PLIST"
-            echo "Display Name → $DISPLAY_NAME"
-          fi
-
-          # ── إزالة توقيع قديم (قد يسبب مشاكل) ───────────────
-          codesign --remove-signature "$APP_PATH" 2>/dev/null || true
-          # إزالة توقيعات الـ frameworks الداخلية
-          find "$APP_PATH" -name '*.dylib' -o -name '*.framework' | while read -r f; do
-            codesign --remove-signature "$f" 2>/dev/null || true
-          done
-
-          # ── توقيع جديد بـ ad-hoc (-) ───────────────────────
-          # ad-hoc يشتغل مع TrollStore / Sideloadly / AltStore
-          find "$APP_PATH" -name '*.dylib' | while read -r f; do
-            codesign --force --sign - "$f" 2>/dev/null || true
-          done
-          find "$APP_PATH/Frameworks" -maxdepth 1 2>/dev/null | while read -r f; do
-            codesign --force --sign - "$f" 2>/dev/null || true
-          done
-          codesign --force --deep --sign - "$APP_PATH"
-
-          # ── إعادة الضغط كـ IPA ─────────────────────────────
-          OUT_IPA="$WORK/${OUTPUT_NAME}.ipa"
-          cd "$EXTRACT"
-          ditto -c -k --sequesterRsrc --keepParent "Payload" "$OUT_IPA"
-          test -s "$OUT_IPA"
-
-          FINAL_SIZE=$(du -sh "$OUT_IPA" | cut -f1)
-          echo "output_ipa=$OUT_IPA" >> "$GITHUB_ENV"
-          echo "ipa_size=$FINAL_SIZE" >> "$GITHUB_ENV"
-          echo "Done: $OUT_IPA ($FINAL_SIZE)"
-
-      # ── 4. رفع IPA الناتجة ────────────────────────────────
-      - name: Upload signed IPA
-        uses: actions/upload-artifact@v3    # v3 = Node.js 16
+          PUBSPEC=$(find . -name pubspec.yaml -not -path "*/.symlinks/*" -not -path "*/build/*" | head -n1)
+          WS=$(find . -name "*.xcworkspace" -not -path "*/project.xcworkspace" -not -path "*/Pods/*" | head -n1)
+          PROJ=$(find . -name "*.xcodeproj" -not -path "*/Pods/*" | head -n1)
+          if [ -n "$PUBSPEC" ]; then echo "type=flutter" >> $GITHUB_OUTPUT; echo "dir=$(dirname "$PUBSPEC")" >> $GITHUB_OUTPUT;
+          elif [ -n "$WS" ]; then echo "type=workspace" >> $GITHUB_OUTPUT; echo "path=$WS" >> $GITHUB_OUTPUT;
+          elif [ -n "$PROJ" ]; then echo "type=project" >> $GITHUB_OUTPUT; echo "path=$PROJ" >> $GITHUB_OUTPUT;
+          else echo "No Xcode or Flutter project found"; exit 1; fi
+      - uses: subosito/flutter-action@v2
+        if: steps.detect.outputs.type == 'flutter'
         with:
-          name: ${{ inputs.output_name }}-ipa
-          path: ${{ env.output_ipa }}
-          retention-days: 14
-
-      # ── 5. ملخص ────────────────────────────────────────────
-      - name: Summary
-        if: always()
+          channel: stable
+      - name: Build Flutter
+        if: steps.detect.outputs.type == 'flutter'
+        working-directory: ${{ steps.detect.outputs.dir }}
         run: |
-          {
-            echo "### IPA Sign Result"
-            echo "| Field | Value |"
-            echo "|---|---|"
-            echo "| Output | ${{ inputs.output_name }}.ipa |"
-            echo "| Size | ${ipa_size:-?} |"
-            echo "| Bundle ID | ${BUNDLE_ID:-unchanged} |"
-            echo "| Signing | ad-hoc (TrollStore / Sideloadly ready) |"
-          } >> "$GITHUB_STEP_SUMMARY"
-        env:
-          BUNDLE_ID: ${{ inputs.bundle_id }}
-
-      # ── 6. تنظيف ──────────────────────────────────────────
-      - name: Cleanup
-        if: always()
-        run: rm -rf "$RUNNER_TEMP/ipa_work"
+          flutter pub get
+          flutter build ios --release --no-codesign
+          mkdir -p $GITHUB_WORKSPACE/out/Payload
+          cp -r build/ios/iphoneos/*.app $GITHUB_WORKSPACE/out/Payload/
+      - name: Build Xcode
+        if: steps.detect.outputs.type != 'flutter'
+        run: |
+          P="${{ steps.detect.outputs.path }}"
+          DIR=$(dirname "$P")
+          if [ -f "$DIR/Podfile" ]; then (cd "$DIR" && pod install); P=$(find "$DIR" -maxdepth 1 -name "*.xcworkspace" | head -n1); fi
+          if [[ "$P" == *.xcworkspace ]]; then FLAG="-workspace"; else FLAG="-project"; fi
+          SCHEME=$(xcodebuild -list $FLAG "$P" -json | python3 -c "import sys,json;d=json.load(sys.stdin);k='workspace' if 'workspace' in d else 'project';print(d[k]['schemes'][0])")
+          xcodebuild $FLAG "$P" -scheme "$SCHEME" -configuration Release -sdk iphoneos \
+            -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
+          mkdir -p out/Payload
+          cp -r build/Build/Products/Release-iphoneos/*.app out/Payload/
+      - name: Package IPA
+        run: cd out && zip -qry app.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-ipa
+          path: out/app.ipa
